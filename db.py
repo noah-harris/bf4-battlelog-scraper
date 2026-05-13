@@ -1,38 +1,16 @@
 import os
-from contextlib import contextmanager
-from pathlib import Path
-import psycopg2
-from dotenv import load_dotenv
+import sqlalchemy
 
-_SQL_DIR = Path(__file__).parent / "sql"
+_engine: sqlalchemy.Engine | None = None
 
-load_dotenv()
 
-_DATABASE_URL = os.environ["DATABASE_URL"]
+def _get_engine() -> sqlalchemy.Engine:
+    global _engine
+    if _engine is None:
+        url = "postgresql+psycopg2://{DB_USERNAME}:{DB_PASSWORD}@{HOST}:{INTERNAL_PORT}/bf4".format_map(os.environ)
+        _engine = sqlalchemy.create_engine(url, pool_pre_ping=True)
+    return _engine
 
-@contextmanager
+
 def get_conn():
-    conn = psycopg2.connect(_DATABASE_URL)
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-def init_db() -> None:
-    order = (_SQL_DIR / "order.txt").read_text().splitlines()
-    print("Initializing database with SQL files in the following order: %s", order)
-    sql_files = [_SQL_DIR / name for name in order if name.strip()]
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            for sql_file in sql_files:
-                cur.execute(sql_file.read_text())
-                print(f"Executed {sql_file.name}")
-                conn.commit()
-            with open("SeedDataInsert.sql") as f:
-                cur.execute(f.read())
-                print(f"Executed SeedDataInsert.sql")
-                conn.commit()
+    return _get_engine().begin()

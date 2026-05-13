@@ -1,9 +1,10 @@
+import sqlalchemy
+
 from requesting import _get_json, _get_text
 import re
 import json
 from db import get_conn
 from datetime import datetime, timezone
-from psycopg2.extras import execute_values
 import pandas as pd
 import colorlog
 
@@ -22,26 +23,23 @@ logger = colorlog.getLogger("pipeline")
 logger.addHandler(handler)
 logger.setLevel(colorlog.DEBUG)
 
-def download_ea_text_content() -> None:
-    """
-        Download EA text content and upsert it into the database.
-    """
 
+def download_ea_text_content() -> None:
     def get_ea_text_content() -> dict[str, str]:
-        """Get the mapping of EA text keys to their English content, by scraping the JavaScript localization file."""
-        js_text = _get_text(f"https://cdn.battlelog.com/bl-cdn/cdnprefix/develop-8950182/public/dynamic/bf4/en_US.js")
+        js_text = _get_text("https://cdn.battlelog.com/bl-cdn/cdnprefix/develop-8950182/public/dynamic/bf4/en_US.js")
         return dict(re.findall(r"t\['([^']+)'\]\s*=\s*\"((?:[^\"\\]|\\.)*)\"", js_text))
 
     def upsert_ea_text(text_map: dict[str, str]) -> None:
         if not text_map:
             return
+        rows = [{"ea_text_id": k, "ea_text": v} for k, v in text_map.items()]
         with get_conn() as conn:
-            with conn.cursor() as cur:
-                execute_values(cur, """
-                    INSERT INTO ea_cdn_text (ea_text_id, ea_text)
-                    VALUES %s
-                    ON CONFLICT (ea_text_id) DO UPDATE SET ea_text = EXCLUDED.ea_text
-                """, list(text_map.items()))
+            conn.execute(sqlalchemy.text("""
+                INSERT INTO ea_cdn_text (ea_text_id, ea_text)
+                VALUES (:ea_text_id, :ea_text)
+                ON CONFLICT (ea_text_id) DO UPDATE SET ea_text = EXCLUDED.ea_text
+            """), rows)
+
     logger.info("Downloading EA text content...")
     text_map = get_ea_text_content()
     logger.debug(f"Fetched {len(text_map)} EA text keys from CDN")
@@ -50,34 +48,24 @@ def download_ea_text_content() -> None:
 
 
 def download_servers() -> None:
-    """
-        Download all currently active servers and their snapshots, and upsert them into the database.
-    """
-
     def get_current_unique_servers() -> list[dict]:
-        """Get a list of unique servers currently active in the server browser."""
-        # servers: list[dict] = _get_json("https://battlelog.battlefield.com/bf4/servers/").get('globalContext', {}).get('servers', {})
         servers: list[dict] = _get_json("https://battlelog.battlefield.com/bf4/servers/pc/?filtered=1&expand=1&settings=&useLocation=1&useAdvanced=-1&gameexpansions=-1&slots=16&slots=1&slots=2&slots=4&q=&serverTypes=1&serverTypes=2&gameexpansions=-1&gameexpansions=-1&gameexpansions=-1&gameexpansions=-1&gameexpansions=-1&mapRotation=-1&modeRotation=-1&password=-1&regions=1&osls=-1&vvsa=-1&vffi=-1&vaba=-1&vkca=-1&v3ca=-1&v3sp=-1&vmsp=-1&vrhe=-1&vhud=-1&vmin=-1&vnta=-1&vbdm-min=1&vbdm-max=300&vprt-min=1&vprt-max=300&vshe-min=1&vshe-max=300&vtkk-min=1&vtkk-max=99&vnit-min=30&vnit-max=86400&vtkc-min=1&vtkc-max=99&vvsd-min=0&vvsd-max=500&vgmc-min=0&vgmc-max=500").get('globalContext', {}).get('servers', {})
-        server_list = []
-        [server_list.append({
+        return [{
             'server_ip': server['ip'],
             'server_port': server['port'],
             'server_guid': server['guid'],
             'server_name': server['name'],
-        }) for server in servers]
-        return server_list
-    
+        } for server in servers]
 
     def upsert_servers(servers: list[dict]) -> None:
         if not servers:
             return
         with get_conn() as conn:
-            with conn.cursor() as cur:
-                execute_values(cur, """
-                    INSERT INTO server (server_ip, server_port, server_guid, server_name)
-                    VALUES %s
-                    ON CONFLICT (server_ip, server_port, server_guid, server_name) DO NOTHING
-                """, [(s['server_ip'], s['server_port'], s['server_guid'], s['server_name']) for s in servers])
+            conn.execute(sqlalchemy.text("""
+                INSERT INTO server (server_ip, server_port, server_guid, server_name)
+                VALUES (:server_ip, :server_port, :server_guid, :server_name)
+                ON CONFLICT (server_ip, server_port, server_guid, server_name) DO NOTHING
+            """), servers)
 
     logger.info("Fetching current server list...")
     servers = get_current_unique_servers()
@@ -89,12 +77,7 @@ def download_servers() -> None:
 
 
 def download_server_snapshot(server_guid) -> None:
-    """
-        Download the current snapshot of the given server, including player and match details, and upsert them into the database.
-    """
-
     def get_server_snapshot(server_guid: str) -> dict:
-        """Get a live snapshot of the server state, including current players, map, scores, and round timer."""
         server_json = _get_json(f"https://keeper.battlelog.com/snapshot/{server_guid}")
 
         GAME_MODE_TO_SCORE_FIELD = {
@@ -131,10 +114,8 @@ def download_server_snapshot(server_guid) -> None:
             'team_2_max_tickets': server_json.get('snapshot', {}).get(team_score_key, {}).get('2', {}).get('ticketsMax', 0),
         }
         player_data = []
-        team_info:dict = server_json.get('snapshot', {}).get('teamInfo', [])
+        team_info: dict = server_json.get('snapshot', {}).get('teamInfo', [])
         for team_id, team in team_info.items():
-            team_id:int
-            team:dict
             faction_id = team.get('faction')
             for persona_id, player_info in team.get('players', {}).items():
                 player_data.append({
@@ -153,57 +134,51 @@ def download_server_snapshot(server_guid) -> None:
                 })
         return server_data, player_data
 
-
     def upsert_match(server_data: dict) -> None:
         if server_data.get('game_mode') is None:
             server_data['game_mode'] = ''
         with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO match (
-                        server_guid, game_id, game_mode, max_players, round_time, current_map, match_timestamp,
-                        team_0_tickets, team_0_max_tickets, team_1_tickets, team_1_max_tickets,
-                        team_2_tickets, team_2_max_tickets
-                    ) VALUES (
-                        %(server_guid)s, %(game_id)s, %(game_mode)s, %(max_players)s, %(round_time)s,
-                        %(current_map)s, %(match_timestamp)s,
-                        %(team_0_tickets)s, %(team_0_max_tickets)s, %(team_1_tickets)s, %(team_1_max_tickets)s,
-                        %(team_2_tickets)s, %(team_2_max_tickets)s
-                    )
-                    ON CONFLICT (server_guid, game_id) DO UPDATE SET
-                        round_time = EXCLUDED.round_time,
-                        match_timestamp = EXCLUDED.match_timestamp,
-                        team_0_tickets = EXCLUDED.team_0_tickets,
-                        team_1_tickets = EXCLUDED.team_1_tickets,
-                        team_2_tickets = EXCLUDED.team_2_tickets
-                """, server_data)
-
+            conn.execute(sqlalchemy.text("""
+                INSERT INTO match (
+                    server_guid, game_id, game_mode, max_players, round_time, current_map, match_timestamp,
+                    team_0_tickets, team_0_max_tickets, team_1_tickets, team_1_max_tickets,
+                    team_2_tickets, team_2_max_tickets
+                ) VALUES (
+                    :server_guid, :game_id, :game_mode, :max_players, :round_time,
+                    :current_map, :match_timestamp,
+                    :team_0_tickets, :team_0_max_tickets, :team_1_tickets, :team_1_max_tickets,
+                    :team_2_tickets, :team_2_max_tickets
+                )
+                ON CONFLICT (server_guid, game_id) DO UPDATE SET
+                    round_time = EXCLUDED.round_time,
+                    match_timestamp = EXCLUDED.match_timestamp,
+                    team_0_tickets = EXCLUDED.team_0_tickets,
+                    team_1_tickets = EXCLUDED.team_1_tickets,
+                    team_2_tickets = EXCLUDED.team_2_tickets
+            """), server_data)
 
     def upsert_match_players(players: list[dict]) -> None:
         if not players:
             return
         with get_conn() as conn:
-            with conn.cursor() as cur:
-                execute_values(cur, """
-                    INSERT INTO match_players (
-                        server_guid, game_id, team_id, faction_id, persona_id, player_name, player_tag,
-                        player_score, player_kills, player_deaths, player_squad, player_role
-                    ) VALUES %s
-                    ON CONFLICT (server_guid, game_id, persona_id) DO UPDATE SET
-                        player_score = EXCLUDED.player_score,
-                        player_kills = EXCLUDED.player_kills,
-                        player_deaths = EXCLUDED.player_deaths,
-                        player_squad = EXCLUDED.player_squad,
-                        player_role = EXCLUDED.player_role
-                """, [(
-                    p['server_guid'], p['game_id'], p['team_id'], p['faction_id'], p['persona_id'],
-                    p['player_name'], p['player_tag'], p['player_score'], p['player_kills'],
-                    p['player_deaths'], p['player_squad'], p['player_role'],
-                ) for p in players])
+            conn.execute(sqlalchemy.text("""
+                INSERT INTO match_players (
+                    server_guid, game_id, team_id, faction_id, persona_id, player_name, player_tag,
+                    player_score, player_kills, player_deaths, player_squad, player_role
+                ) VALUES (
+                    :server_guid, :game_id, :team_id, :faction_id, :persona_id, :player_name, :player_tag,
+                    :player_score, :player_kills, :player_deaths, :player_squad, :player_role
+                )
+                ON CONFLICT (server_guid, game_id, persona_id) DO UPDATE SET
+                    player_score = EXCLUDED.player_score,
+                    player_kills = EXCLUDED.player_kills,
+                    player_deaths = EXCLUDED.player_deaths,
+                    player_squad = EXCLUDED.player_squad,
+                    player_role = EXCLUDED.player_role
+            """), players)
 
         for p in players:
             download_user_information(p['persona_id'])
-
 
     logger.info(f"Fetching snapshot for server {server_guid}...")
     server_data, player_data = get_server_snapshot(server_guid)
@@ -214,16 +189,14 @@ def download_server_snapshot(server_guid) -> None:
     logger.info(f"Snapshot done — {len(player_data)} players upserted for server {server_guid}")
 
 
-
-def download_user_information(persona_id:int):
-
+def download_user_information(persona_id: int):
     logger.info(f"Downloading user information for persona_id {persona_id}...")
-    def get_persona_info(persona_id:int):
-        data:dict = _get_json(f"https://battlelog.battlefield.com/bf4/warsawoverviewpopulate/{persona_id}/1/").get('data')
-        persona_stats:dict = data.get('overviewStats')
-        user_id = data.get('currentUserId')
-        persona_info:dict = {
-            "user_id": user_id,
+
+    def get_persona_info(persona_id: int):
+        data: dict = _get_json(f"https://battlelog.battlefield.com/bf4/warsawoverviewpopulate/{persona_id}/1/").get('data')
+        persona_stats: dict = data.get('overviewStats')
+        return {
+            "user_id": data.get('currentUserId'),
             "persona_id": persona_id,
             "rank": persona_stats.get('rank', 0),
             "skill": persona_stats.get('skill', 0),
@@ -237,12 +210,10 @@ def download_user_information(persona_id:int):
             "score": persona_stats.get('score', 0),
             "score_per_minute": persona_stats.get('scorePerMinute', 0),
             "time_played": persona_stats.get('timePlayed', 0),
-            "accuracy": persona_stats.get('accuracy', 0)
+            "accuracy": persona_stats.get('accuracy', 0),
         }
-        return persona_info
-    
+
     def get_personas(user_id: int) -> list[dict]:
-        """List all personas (gamer profiles) on the user account that owns this persona."""
         data = _get_json(f"https://battlelog.battlefield.com/bf4/user/overviewBoxStats/{user_id}/")
         soldiers = data.get("data", {}).get("soldiersBox", []) or []
         personas = [soldier['persona'] for soldier in soldiers]
@@ -256,57 +227,57 @@ def download_user_information(persona_id:int):
             for p in personas
         ]
 
-    def get_weapon_stats(persona_id: int) -> list[dict]:
-        data:dict = _get_json(f"https://battlelog.battlefield.com/bf4/warsawWeaponsPopulateStats/{persona_id}/1/stats/").get("data")
-        df = pd.DataFrame(data.get("mainWeaponStats") or [])
-        return df
+    def get_weapon_stats(persona_id: int) -> pd.DataFrame:
+        data: dict = _get_json(f"https://battlelog.battlefield.com/bf4/warsawWeaponsPopulateStats/{persona_id}/1/stats/").get("data")
+        return pd.DataFrame(data.get("mainWeaponStats") or [])
 
-
-    def upsert_persona_info(persona_info:dict):
+    def upsert_user_id(user_id: int):
         with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO persona_info (user_id, persona_id, rank, skill, kills, deaths, kd_ratio, kills_per_minute, num_wins, num_rounds, num_losses, score, score_per_minute, time_played, accuracy)
-                    VALUES (%(user_id)s, %(persona_id)s, %(rank)s, %(skill)s, %(kills)s, %(deaths)s, %(kd_ratio)s, %(kills_per_minute)s, %(num_wins)s, %(num_rounds)s, %(num_losses)s, %(score)s, %(score_per_minute)s, %(time_played)s, %(accuracy)s)
-                    ON CONFLICT (persona_id) DO UPDATE SET
-                        rank = EXCLUDED.rank,
-                        skill = EXCLUDED.skill,
-                        kills = EXCLUDED.kills,
-                        deaths = EXCLUDED.deaths,
-                        kd_ratio = EXCLUDED.kd_ratio,
-                        kills_per_minute = EXCLUDED.kills_per_minute,
-                        num_wins = EXCLUDED.num_wins,
-                        num_rounds = EXCLUDED.num_rounds,
-                        num_losses = EXCLUDED.num_losses,
-                        score = EXCLUDED.score,
-                        score_per_minute = EXCLUDED.score_per_minute,
-                        time_played = EXCLUDED.time_played,
-                        accuracy = EXCLUDED.accuracy
-                """, persona_info)
+            conn.execute(sqlalchemy.text("""
+                INSERT INTO ea_user (user_id) VALUES (:user_id)
+                ON CONFLICT (user_id) DO NOTHING
+            """), {"user_id": user_id})
 
     def upsert_personas(personas: list[dict]) -> None:
         if not personas:
             return
         now = datetime.now(timezone.utc)
         with get_conn() as conn:
-            with conn.cursor() as cur:
-                execute_values(cur, """
-                    INSERT INTO ea_user (user_id) VALUES %s
-                    ON CONFLICT (user_id) DO NOTHING
-                """, [(p['user_id'],) for p in personas])
-                execute_values(cur, """
-                    INSERT INTO persona (user_id, persona_id, persona_name, platform, initial_timestamp)
-                    VALUES %s
-                    ON CONFLICT (persona_id) DO NOTHING
-                """, [(p['user_id'], p['persona_id'], p['persona_name'], p['platform'], now) for p in personas])
+            conn.execute(sqlalchemy.text("""
+                INSERT INTO ea_user (user_id) VALUES (:user_id)
+                ON CONFLICT (user_id) DO NOTHING
+            """), [{"user_id": p['user_id']} for p in personas])
+            conn.execute(sqlalchemy.text("""
+                INSERT INTO persona (user_id, persona_id, persona_name, platform, initial_timestamp)
+                VALUES (:user_id, :persona_id, :persona_name, :platform, :initial_timestamp)
+                ON CONFLICT (persona_id) DO NOTHING
+            """), [{**p, 'initial_timestamp': now} for p in personas])
 
-    def upsert_user_id(user_id:int):
+    def upsert_persona_info(persona_info: dict):
         with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO ea_user (user_id) VALUES (%s)
-                    ON CONFLICT (user_id) DO NOTHING
-                """, (user_id,))
+            conn.execute(sqlalchemy.text("""
+                INSERT INTO persona_info (
+                    user_id, persona_id, rank, skill, kills, deaths, kd_ratio, kills_per_minute,
+                    num_wins, num_rounds, num_losses, score, score_per_minute, time_played, accuracy
+                ) VALUES (
+                    :user_id, :persona_id, :rank, :skill, :kills, :deaths, :kd_ratio, :kills_per_minute,
+                    :num_wins, :num_rounds, :num_losses, :score, :score_per_minute, :time_played, :accuracy
+                )
+                ON CONFLICT (persona_id) DO UPDATE SET
+                    rank = EXCLUDED.rank,
+                    skill = EXCLUDED.skill,
+                    kills = EXCLUDED.kills,
+                    deaths = EXCLUDED.deaths,
+                    kd_ratio = EXCLUDED.kd_ratio,
+                    kills_per_minute = EXCLUDED.kills_per_minute,
+                    num_wins = EXCLUDED.num_wins,
+                    num_rounds = EXCLUDED.num_rounds,
+                    num_losses = EXCLUDED.num_losses,
+                    score = EXCLUDED.score,
+                    score_per_minute = EXCLUDED.score_per_minute,
+                    time_played = EXCLUDED.time_played,
+                    accuracy = EXCLUDED.accuracy
+            """), persona_info)
 
     def upsert_weapon_stats(persona_id: int, weapon_stats: pd.DataFrame):
         if weapon_stats.empty:
@@ -328,7 +299,7 @@ def download_user_information(persona_id:int):
         }
         df = weapon_stats.rename(columns=col_map)
         df['persona_id'] = persona_id
-        df = df.where(pd.notnull(df), None)
+        df = df.astype(object).where(pd.notnull(df), None)
         if 'unlocks' in df.columns:
             df['unlocks'] = df['unlocks'].apply(lambda x: json.dumps(x) if x is not None else None)
 
@@ -341,16 +312,18 @@ def download_user_information(persona_id:int):
         ]
         cols = [c for c in all_cols if c in df.columns]
         update_cols = [c for c in cols if c not in ('persona_id', 'guid')]
-        rows = [tuple(row[c] for c in cols) for _, row in df.iterrows()]
+
+        cols_str = ', '.join(cols)
+        params_str = ', '.join(f':{c}' for c in cols)
+        update_str = ', '.join(f'{c} = EXCLUDED.{c}' for c in update_cols)
+        rows = df[cols].to_dict('records')
 
         with get_conn() as conn:
-            with conn.cursor() as cur:
-                execute_values(cur, f"""
-                    INSERT INTO persona_weapon_stats ({', '.join(cols)})
-                    VALUES %s
-                    ON CONFLICT (persona_id, guid) DO UPDATE SET
-                        {', '.join(f'{c} = EXCLUDED.{c}' for c in update_cols)}
-                """, rows)
+            conn.execute(sqlalchemy.text(f"""
+                INSERT INTO persona_weapon_stats ({cols_str})
+                VALUES ({params_str})
+                ON CONFLICT (persona_id, guid) DO UPDATE SET {update_str}
+            """), rows)
 
     persona_info = get_persona_info(persona_id)
     user_id = persona_info['user_id']
@@ -371,4 +344,3 @@ def download_user_information(persona_id:int):
 
     upsert_weapon_stats(persona_id, weapon_stats)
     logger.debug(f"Upserted weapon stats for persona_id={persona_id}")
-

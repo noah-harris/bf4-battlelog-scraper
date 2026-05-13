@@ -3,26 +3,67 @@ services:
     image: postgres:16
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: postgres
     ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
+      - "${EXTERNAL_PORT}:${INTERNAL_PORT}"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME} -d postgres -h ${HOST} -p ${INTERNAL_PORT}"]
       interval: 5s
       retries: 5
 
-  db-init:
-    build: .
-    restart: "no"
+  init-db:
+    container_name: init-db
+    image: noahharriscontact/db-deployer-initializer:latest
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q '\"status\": \"ready\"' /app/sql-scripts/status.json"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
     depends_on:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+      HOST: ${HOST}
+      INTERNAL_PORT: ${INTERNAL_PORT}
+      EXTERNAL_PORT: ${EXTERNAL_PORT}
+      DIALECT: ${DIALECT}
+      RESTORE_POINT_INTERVAL_MINUTES: ${RESTORE_POINT_INTERVAL_MINUTES}
+      RESTORE_POINT_RETENTION: ${RESTORE_POINT_RETENTION}
+
+    volumes:
+      - restore:/app/restore
+      - sql-scripts:/app/sql-scripts
+
+  scraper:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+      HOST: ${HOST}
+      INTERNAL_PORT: ${INTERNAL_PORT}
+      EXTERNAL_PORT: ${EXTERNAL_PORT}
+      DIALECT: ${DIALECT}
 
 volumes:
-  pgdata:
+  restore:
+    driver: local
+    driver_opts:
+      type: ${TYPE}
+      device: "${RESTORE_POINT_DIRECTORY}"
+      o: ${O}
+
+  sql-scripts:
+    driver: local
+    driver_opts:
+      type: ${TYPE}
+      device: "${SQL_PROJECT_DIRECTORY}"
+      o: ${O}

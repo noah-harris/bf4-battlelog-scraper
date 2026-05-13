@@ -16,11 +16,5 @@ INSERT INTO gamemode (gamemode_id, gamemode_name) VALUES
 (134217728, 'Squad Obliteration'),
 (34359738368, 'CTE Mode'),
 (68719476736, 'Conquest (CTE)'),
-(137438953472, 'Obliteration (CTE)');
-
-INSERT INTO platform (ea_namespace, platform_name) VALUES
-('xbox', 'Xbox'),
-('xbl_sub', 'Xbox'),
-('ps4', 'PlayStation 4'),
-('ps3', 'PlayStation 3'),
-('cem_ea_id', 'PC');
+(137438953472, 'Obliteration (CTE)')
+ON CONFLICT (gamemode_id) DO NOTHING;

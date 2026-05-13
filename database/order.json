@@ -1,0 +1,18 @@
+{
+    "project":[
+        {"database":"bf4", "schema":"public", "name":"ea_user", "type":"table"},
+        {"database":"bf4", "schema":"public", "name":"platform", "type":"table"},
+        {"database":"bf4", "schema":"public", "name":"gamemode", "type":"table"},
+        {"database":"bf4", "schema":"public", "name":"server", "type":"table"},
+        {"database":"bf4", "schema":"public", "name":"ea_text_content", "type":"table"},
+        {"database":"bf4", "schema":"public", "name":"persona", "type":"table"},
+        {"database":"bf4", "schema":"public", "name":"persona_info", "type":"table"},
+        {"database":"bf4", "schema":"public", "name":"persona_weapon_stats", "type":"table"},
+        {"database":"bf4", "schema":"public", "name":"match", "type":"table"},
+        {"database":"bf4", "schema":"public", "name":"match_players", "type":"table"}
+    ],
+    "post-init":[
+        {"database":"bf4", "file":"load_gamemode.sql"},
+        {"database":"bf4", "file":"load_platform.sql"}
+    ]
+}
